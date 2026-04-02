@@ -12,6 +12,7 @@ Mantem dois modos:
 - `OPENCLAW_TOKEN` (obrigatoria, alternativa a `OPENCLAW_TOKEN_FILE`)
 - `OPENCLAW_TOKEN_FILE` (caminho de arquivo com token)
 - `OPENCLAW_UPSTREAM_URL` (default: `http://127.0.0.1:18789`)
+- `OPENCLAW_SCOPES` (default: `operator.write,operator.read`)
 - `PORT` (default: `8080`)
 
 ## Rodar local
@@ -85,6 +86,7 @@ export OPENCLAW_API_IMAGE='ghcr.io/SEU_USER/openclaw-api:latest'
 export OPENCLAW_API_HOST='openclaw-api.pullse.ia.br'
 export OPENCLAW_UPSTREAM_URL='http://127.0.0.1:18789'
 export OPENCLAW_TOKEN='SEU_TOKEN'
+export OPENCLAW_SCOPES='operator.write,operator.read'
 export TRAEFIK_CERTRESOLVER='letsencrypt'
 
 docker stack deploy -c stack.yml openclaw
@@ -111,6 +113,7 @@ export OPENCLAW_API_HOST='openclaw-api.pullse.ia.br'
 export OPENCLAW_API_PREFIX='/openclaw-api'
 export OPENCLAW_UPSTREAM_URL='http://127.0.0.1:18789'
 export OPENCLAW_TOKEN='SEU_TOKEN'
+export OPENCLAW_SCOPES='operator.write,operator.read'
 export TRAEFIK_CERTRESOLVER='letsencrypt'
 
 docker stack deploy -c stack.pathprefix.yml openclaw

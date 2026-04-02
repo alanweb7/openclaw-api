@@ -24,21 +24,22 @@ type config struct {
 	ListenAddr  string
 	UpstreamURL string
 	Token       string
+	Scopes      string
 }
 
 type chatRequest struct {
-	UserID         string             `json:"user_id"`
-	AgentID        string             `json:"agent_id"`
-	SessionKey     string             `json:"session_key"`
-	Message        string             `json:"message"`
-	Locale         string             `json:"locale,omitempty"`
-	Temperature    *float64           `json:"temperature,omitempty"`
-	MaxTokens      *int               `json:"max_tokens,omitempty"`
-	Model          string             `json:"model,omitempty"`
-	BackendModel   string             `json:"backend_model,omitempty"`
-	MessageChannel string             `json:"message_channel,omitempty"`
-	Metadata       map[string]any     `json:"metadata,omitempty"`
-	ExtraHeaders   map[string]string  `json:"extra_headers,omitempty"`
+	UserID         string            `json:"user_id"`
+	AgentID        string            `json:"agent_id"`
+	SessionKey     string            `json:"session_key"`
+	Message        string            `json:"message"`
+	Locale         string            `json:"locale,omitempty"`
+	Temperature    *float64          `json:"temperature,omitempty"`
+	MaxTokens      *int              `json:"max_tokens,omitempty"`
+	Model          string            `json:"model,omitempty"`
+	BackendModel   string            `json:"backend_model,omitempty"`
+	MessageChannel string            `json:"message_channel,omitempty"`
+	Metadata       map[string]any    `json:"metadata,omitempty"`
+	ExtraHeaders   map[string]string `json:"extra_headers,omitempty"`
 }
 
 type chatResponse struct {
@@ -125,6 +126,7 @@ func main() {
 		ListenAddr:  getenv("PORT", "8080"),
 		UpstreamURL: strings.TrimRight(getenv("OPENCLAW_UPSTREAM_URL", "http://127.0.0.1:18789"), "/"),
 		Token:       token,
+		Scopes:      getenv("OPENCLAW_SCOPES", "operator.write,operator.read"),
 	}
 
 	jobs := &jobStore{jobs: make(map[string]*jobResponse)}
@@ -242,6 +244,9 @@ func callOpenClaw(ctx context.Context, cfg config, req chatRequest) (string, err
 	httpReq.Header.Set("x-openclaw-session-key", req.SessionKey)
 	httpReq.Header.Set("x-openclaw-user-id", req.UserID)
 	httpReq.Header.Set("Accept-Language", req.Locale)
+	if strings.TrimSpace(cfg.Scopes) != "" {
+		httpReq.Header.Set("x-openclaw-scopes", cfg.Scopes)
+	}
 	if strings.TrimSpace(req.BackendModel) != "" {
 		httpReq.Header.Set("x-openclaw-model", req.BackendModel)
 	}

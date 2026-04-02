@@ -6,6 +6,7 @@ services:
     environment:
       OPENCLAW_UPSTREAM_URL: ${OPENCLAW_UPSTREAM_URL:-http://127.0.0.1:18789}
       OPENCLAW_TOKEN: ${OPENCLAW_TOKEN}
+      OPENCLAW_SCOPES: ${OPENCLAW_SCOPES:-operator.write,operator.read}
       PORT: "8080"
     networks:
       - traefik_public
