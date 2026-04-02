@@ -1,0 +1,7 @@
+.git
+.gitignore
+*.exe
+*.log
+tmp
+dist
+vendor

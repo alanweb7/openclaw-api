@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  openclaw-api:
+    image: ${OPENCLAW_API_IMAGE:-openclaw-api:latest}
+    environment:
+      OPENCLAW_UPSTREAM_URL: ${OPENCLAW_UPSTREAM_URL:-http://127.0.0.1:18789}
+      OPENCLAW_TOKEN: ${OPENCLAW_TOKEN}
+      PORT: "8080"
+    networks:
+      - traefik_public
+      - openclaw_internal
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: on-failure
+      update_config:
+        parallelism: 1
+        order: start-first
+      labels:
+        - "traefik.enable=true"
+        - "traefik.docker.network=traefik_public"
+        - "traefik.http.routers.openclaw-api.rule=Host(`${OPENCLAW_API_HOST:-openclaw-api.pullse.ia.br}`)"
+        - "traefik.http.routers.openclaw-api.entrypoints=websecure"
+        - "traefik.http.routers.openclaw-api.tls=true"
+        - "traefik.http.routers.openclaw-api.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+        - "traefik.http.services.openclaw-api.loadbalancer.server.port=8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  traefik_public:
+    external: true
+  openclaw_internal:
+    driver: overlay
