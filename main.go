@@ -136,6 +136,9 @@ type jobStore struct {
 }
 
 var jobCounter uint64
+var wsManagerMu sync.Mutex
+var wsManagerInstance *wsManager
+var wsManagerKey string
 
 const (
 	jobStatusQueued    = "queued"
@@ -330,58 +333,18 @@ func callOpenClawHTTP(ctx context.Context, cfg config, req chatRequest) (string,
 }
 
 func callOpenClawWS(ctx context.Context, cfg config, req chatRequest) (string, error) {
-	wsURL, origin, err := wsEndpointFromUpstream(cfg.UpstreamURL)
+	mgr, err := getWSManager(cfg)
 	if err != nil {
-		return "", fmt.Errorf("invalid OPENCLAW_UPSTREAM_URL for websocket: %w", err)
+		return "", err
 	}
 
-	header := http.Header{}
-	if origin != "" {
-		header.Set("Origin", origin)
-	}
-
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 15 * time.Second,
-	}
-	conn, _, err := dialer.DialContext(ctx, wsURL, header)
-	if err != nil {
-		return "", fmt.Errorf("websocket dial failed: %w", err)
-	}
-	defer conn.Close()
-
-	scopes := parseScopes(cfg.Scopes)
-	connectParams := map[string]any{
-		"minProtocol": 3,
-		"maxProtocol": 3,
-		"client": map[string]any{
-			// Gateway validates client.id/mode against an allowlist.
-			// "openclaw-control-ui"+"webchat" is accepted in current OpenClaw builds.
-			"id":         "openclaw-control-ui",
-			"version":    "control-ui",
-			"platform":   "linux",
-			"mode":       "webchat",
-			"instanceId": "openclaw-api",
-		},
-		"role":      "operator",
-		"scopes":    scopes,
-		"caps":      []string{"tool-events"},
-		"auth":      map[string]any{"token": cfg.Token},
-		"userAgent": "openclaw-api/1.0",
-		"locale":    req.Locale,
-	}
-
-	if _, err := wsRequestCall(ctx, conn, "connect", connectParams); err != nil {
-		return "", fmt.Errorf("websocket connect failed: %w", err)
-	}
-
-	baselineCount, baselineText, err := wsAssistantSnapshot(ctx, conn, req.SessionKey)
-	if err != nil {
-		return "", fmt.Errorf("websocket chat.history baseline failed: %w", err)
-	}
+	runID := newWSID()
+	waitCh, unregister := mgr.registerRunWaiter(runID)
+	defer unregister()
 
 	sendParams := map[string]any{
 		"sessionKey":     req.SessionKey,
-		"idempotencyKey": newWSID(),
+		"idempotencyKey": runID,
 		"message":        req.Message,
 	}
 	if strings.TrimSpace(req.MessageChannel) != "" {
@@ -390,134 +353,28 @@ func callOpenClawWS(ctx context.Context, cfg config, req chatRequest) (string, e
 	if strings.TrimSpace(req.BackendModel) != "" {
 		sendParams["model"] = req.BackendModel
 	}
-	if _, err := wsRequestCall(ctx, conn, "chat.send", sendParams); err != nil {
+	raw, err := mgr.request(ctx, "chat.send", sendParams)
+	if err != nil {
 		return "", fmt.Errorf("websocket chat.send failed: %w", err)
 	}
 
-	ticker := time.NewTicker(1200 * time.Millisecond)
-	defer ticker.Stop()
+	var sendRes struct {
+		RunID string `json:"runId"`
+	}
+	if err := json.Unmarshal(raw, &sendRes); err == nil && strings.TrimSpace(sendRes.RunID) != "" && sendRes.RunID != runID {
+		waitCh, unregister = mgr.renameRunWaiter(runID, sendRes.RunID, waitCh, unregister)
+		runID = sendRes.RunID
+	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return "", fmt.Errorf("timeout waiting chat response: %w", ctx.Err())
-		case <-ticker.C:
-			count, lastText, err := wsAssistantSnapshot(ctx, conn, req.SessionKey)
-			if err != nil {
-				continue
-			}
-			if strings.TrimSpace(lastText) == "" {
-				continue
-			}
-			if count > baselineCount || lastText != baselineText {
-				return strings.TrimSpace(lastText), nil
-			}
+	select {
+	case content := <-waitCh:
+		if strings.TrimSpace(content) == "" {
+			return "", errors.New("upstream returned empty content")
 		}
+		return strings.TrimSpace(content), nil
+	case <-ctx.Done():
+		return "", fmt.Errorf("timeout waiting chat response for run %s: %w", runID, ctx.Err())
 	}
-}
-
-func wsAssistantSnapshot(ctx context.Context, conn *websocket.Conn, sessionKey string) (int, string, error) {
-	raw, err := wsRequestCall(ctx, conn, "chat.history", map[string]any{
-		"sessionKey": sessionKey,
-		"limit":      60,
-	})
-	if err != nil {
-		return 0, "", err
-	}
-
-	var payload struct {
-		Messages []struct {
-			Role    string `json:"role"`
-			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"messages"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return 0, "", err
-	}
-
-	assistantCount := 0
-	lastText := ""
-	for _, m := range payload.Messages {
-		if m.Role != "assistant" {
-			continue
-		}
-		assistantCount++
-		var parts []string
-		for _, c := range m.Content {
-			if c.Type == "text" && strings.TrimSpace(c.Text) != "" {
-				parts = append(parts, c.Text)
-			}
-		}
-		if len(parts) > 0 {
-			lastText = strings.Join(parts, "\n")
-		}
-	}
-	return assistantCount, strings.TrimSpace(lastText), nil
-}
-
-func wsRequestCall(ctx context.Context, conn *websocket.Conn, method string, params any) (json.RawMessage, error) {
-	reqID := newWSID()
-	req := wsRequest{
-		Type:   "req",
-		ID:     reqID,
-		Method: method,
-		Params: params,
-	}
-
-	if err := wsWriteJSON(ctx, conn, req); err != nil {
-		return nil, err
-	}
-
-	for {
-		frame, err := wsReadFrame(ctx, conn)
-		if err != nil {
-			return nil, err
-		}
-		if frame.Type != "res" || frame.ID != reqID {
-			continue
-		}
-		if frame.OK {
-			return frame.Payload, nil
-		}
-
-		msg := "request failed"
-		if frame.Error != nil && strings.TrimSpace(frame.Error.Message) != "" {
-			msg = frame.Error.Message
-		}
-		return nil, errors.New(msg)
-	}
-}
-
-func wsWriteJSON(ctx context.Context, conn *websocket.Conn, v any) error {
-	if dl, ok := ctx.Deadline(); ok {
-		_ = conn.SetWriteDeadline(dl)
-	} else {
-		_ = conn.SetWriteDeadline(time.Now().Add(20 * time.Second))
-	}
-	if err := conn.WriteJSON(v); err != nil {
-		return fmt.Errorf("write websocket frame: %w", err)
-	}
-	return nil
-}
-
-func wsReadFrame(ctx context.Context, conn *websocket.Conn) (wsFrame, error) {
-	if dl, ok := ctx.Deadline(); ok {
-		_ = conn.SetReadDeadline(dl)
-	} else {
-		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	}
-	_, raw, err := conn.ReadMessage()
-	if err != nil {
-		return wsFrame{}, fmt.Errorf("read websocket frame: %w", err)
-	}
-	var frame wsFrame
-	if err := json.Unmarshal(raw, &frame); err != nil {
-		return wsFrame{}, fmt.Errorf("invalid websocket JSON frame: %w", err)
-	}
-	return frame, nil
 }
 
 func wsEndpointFromUpstream(upstream string) (string, string, error) {
@@ -577,6 +434,345 @@ func newWSID() string {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
 	return fmt.Sprintf("%x", b[:])
+}
+
+type wsManager struct {
+	cfg       config
+	wsURL     string
+	origin    string
+	mu        sync.Mutex
+	writeMu   sync.Mutex
+	conn      *websocket.Conn
+	pending   map[string]chan wsFrame
+	runWaiter map[string]chan string
+}
+
+func getWSManager(cfg config) (*wsManager, error) {
+	key := cfg.UpstreamURL + "|" + cfg.Token + "|" + cfg.Scopes
+
+	wsManagerMu.Lock()
+	defer wsManagerMu.Unlock()
+
+	if wsManagerInstance != nil && wsManagerKey == key {
+		return wsManagerInstance, nil
+	}
+
+	mgr, err := newWSManager(cfg)
+	if err != nil {
+		return nil, err
+	}
+	wsManagerInstance = mgr
+	wsManagerKey = key
+	return wsManagerInstance, nil
+}
+
+func newWSManager(cfg config) (*wsManager, error) {
+	wsURL, origin, err := wsEndpointFromUpstream(cfg.UpstreamURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid OPENCLAW_UPSTREAM_URL for websocket: %w", err)
+	}
+	return &wsManager{
+		cfg:       cfg,
+		wsURL:     wsURL,
+		origin:    origin,
+		pending:   map[string]chan wsFrame{},
+		runWaiter: map[string]chan string{},
+	}, nil
+}
+
+func (m *wsManager) request(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := m.ensureConnected(ctx); err != nil {
+			return nil, err
+		}
+		raw, err := m.requestOnce(ctx, method, params)
+		if err == nil {
+			return raw, nil
+		}
+		lastErr = err
+		if !isRetryableWSError(err) {
+			return nil, err
+		}
+		m.resetConnection()
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("request failed")
+}
+
+func (m *wsManager) ensureConnected(ctx context.Context) error {
+	m.mu.Lock()
+	if m.conn != nil {
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+
+	header := http.Header{}
+	if strings.TrimSpace(m.origin) != "" {
+		header.Set("Origin", m.origin)
+	}
+	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
+	conn, _, err := dialer.DialContext(ctx, m.wsURL, header)
+	if err != nil {
+		return fmt.Errorf("websocket dial failed: %w", err)
+	}
+
+	m.mu.Lock()
+	m.conn = conn
+	m.mu.Unlock()
+
+	go m.readLoop(conn)
+
+	connectCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	_, err = m.requestOnce(connectCtx, "connect", map[string]any{
+		"minProtocol": 3,
+		"maxProtocol": 3,
+		"client": map[string]any{
+			"id":         "openclaw-control-ui",
+			"version":    "control-ui",
+			"platform":   "linux",
+			"mode":       "webchat",
+			"instanceId": "openclaw-api",
+		},
+		"role":      "operator",
+		"scopes":    parseScopes(m.cfg.Scopes),
+		"caps":      []string{"tool-events"},
+		"auth":      map[string]any{"token": m.cfg.Token},
+		"userAgent": "openclaw-api/1.0",
+		"locale":    "pt-BR",
+	})
+	if err != nil {
+		m.resetConnection()
+		return fmt.Errorf("websocket connect failed: %w", err)
+	}
+	return nil
+}
+
+func (m *wsManager) requestOnce(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	reqID := newWSID()
+	ch := make(chan wsFrame, 1)
+
+	m.mu.Lock()
+	m.pending[reqID] = ch
+	conn := m.conn
+	m.mu.Unlock()
+
+	if conn == nil {
+		m.mu.Lock()
+		delete(m.pending, reqID)
+		m.mu.Unlock()
+		return nil, errors.New("websocket not connected")
+	}
+
+	req := wsRequest{Type: "req", ID: reqID, Method: method, Params: params}
+	if err := m.writeJSON(ctx, conn, req); err != nil {
+		m.mu.Lock()
+		delete(m.pending, reqID)
+		m.mu.Unlock()
+		return nil, err
+	}
+
+	select {
+	case frame := <-ch:
+		if frame.OK {
+			return frame.Payload, nil
+		}
+		msg := "request failed"
+		if frame.Error != nil && strings.TrimSpace(frame.Error.Message) != "" {
+			msg = frame.Error.Message
+		}
+		return nil, errors.New(msg)
+	case <-ctx.Done():
+		m.mu.Lock()
+		delete(m.pending, reqID)
+		m.mu.Unlock()
+		return nil, ctx.Err()
+	}
+}
+
+func (m *wsManager) writeJSON(ctx context.Context, conn *websocket.Conn, v any) error {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetWriteDeadline(dl)
+	} else {
+		_ = conn.SetWriteDeadline(time.Now().Add(20 * time.Second))
+	}
+	if err := conn.WriteJSON(v); err != nil {
+		return fmt.Errorf("write websocket frame: %w", err)
+	}
+	return nil
+}
+
+func (m *wsManager) readLoop(conn *websocket.Conn) {
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			m.handleReadFailure(conn)
+			return
+		}
+
+		var frame wsFrame
+		if err := json.Unmarshal(raw, &frame); err != nil {
+			continue
+		}
+
+		switch frame.Type {
+		case "res":
+			m.mu.Lock()
+			ch, ok := m.pending[frame.ID]
+			if ok {
+				delete(m.pending, frame.ID)
+			}
+			m.mu.Unlock()
+			if ok {
+				select {
+				case ch <- frame:
+				default:
+				}
+			}
+		case "event":
+			m.handleEvent(raw)
+		}
+	}
+}
+
+func (m *wsManager) handleEvent(raw []byte) {
+	var event struct {
+		Type    string          `json:"type"`
+		Event   string          `json:"event"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(raw, &event); err != nil {
+		return
+	}
+	if event.Event != "chat" {
+		return
+	}
+	var payload struct {
+		RunID   string `json:"runId"`
+		State   string `json:"state"`
+		Message struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return
+	}
+	if payload.State != "final" || payload.Message.Role != "assistant" || strings.TrimSpace(payload.RunID) == "" {
+		return
+	}
+
+	var parts []string
+	for _, c := range payload.Message.Content {
+		if c.Type == "text" && strings.TrimSpace(c.Text) != "" {
+			parts = append(parts, c.Text)
+		}
+	}
+	text := strings.TrimSpace(strings.Join(parts, "\n"))
+	if text == "" {
+		return
+	}
+
+	m.mu.Lock()
+	ch, ok := m.runWaiter[payload.RunID]
+	if ok {
+		delete(m.runWaiter, payload.RunID)
+	}
+	m.mu.Unlock()
+	if ok {
+		select {
+		case ch <- text:
+		default:
+		}
+	}
+}
+
+func (m *wsManager) handleReadFailure(target *websocket.Conn) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.conn != target {
+		return
+	}
+	_ = m.conn.Close()
+	m.conn = nil
+	for id, ch := range m.pending {
+		delete(m.pending, id)
+		select {
+		case ch <- wsFrame{Type: "res", OK: false, Error: &struct {
+			Code    string `json:"code,omitempty"`
+			Message string `json:"message,omitempty"`
+		}{Message: "connection closed"}}:
+		default:
+		}
+	}
+}
+
+func (m *wsManager) resetConnection() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.conn != nil {
+		_ = m.conn.Close()
+	}
+	m.conn = nil
+}
+
+func (m *wsManager) registerRunWaiter(runID string) (<-chan string, func()) {
+	ch := make(chan string, 1)
+	m.mu.Lock()
+	m.runWaiter[runID] = ch
+	m.mu.Unlock()
+	cancel := func() {
+		m.mu.Lock()
+		delete(m.runWaiter, runID)
+		m.mu.Unlock()
+	}
+	return ch, cancel
+}
+
+func (m *wsManager) renameRunWaiter(oldRunID, newRunID string, current <-chan string, currentCancel func()) (<-chan string, func()) {
+	if strings.TrimSpace(newRunID) == "" || newRunID == oldRunID {
+		return current, currentCancel
+	}
+	ch := make(chan string, 1)
+	m.mu.Lock()
+	if oldCh, ok := m.runWaiter[oldRunID]; ok {
+		ch = oldCh
+		delete(m.runWaiter, oldRunID)
+	}
+	m.runWaiter[newRunID] = ch
+	m.mu.Unlock()
+	cancel := func() {
+		m.mu.Lock()
+		delete(m.runWaiter, newRunID)
+		m.mu.Unlock()
+	}
+	return ch, cancel
+}
+
+func isRetryableWSError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection closed") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "use of closed network connection")
 }
 
 func handleCreateJob(w http.ResponseWriter, r *http.Request, cfg config, jobs *jobStore) {

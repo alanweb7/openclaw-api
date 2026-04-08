@@ -135,3 +135,20 @@ curl --location 'https://openclaw-api.pullse.ia.br/openclaw-api/v1/chat' \
 ## Observacao
 
 Jobs sao armazenados em memoria do processo. Se o container reiniciar, o historico de jobs e perdido.
+
+
+mais exemplos de uso
+
+```bash
+curl -X POST "https://openclaw-api.pullse.ia.br/openclaw-api/v1/jobs" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <TOKEN>" \
+  -d '{
+    "user_id":"alanweb7",
+    "agent_id":"main",
+    "session_key":"agent:main:main",
+    "message":"Teste webhook",
+    "callback_url":"https://seu-webhook.com/openclaw",
+    "callback_headers":{"X-Source":"openclaw-api"}
+  }'
+```
