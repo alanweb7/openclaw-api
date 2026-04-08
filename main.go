@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/gorilla/websocket"
 	"io"
 	"log"
 	"net/http"
@@ -69,6 +70,33 @@ type openAIResponse struct {
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
+}
+
+type wsRequest struct {
+	Type   string `json:"type"`
+	ID     string `json:"id"`
+	Method string `json:"method"`
+	Params any    `json:"params"`
+}
+
+type wsFrame struct {
+	Type    string          `json:"type"`
+	ID      string          `json:"id,omitempty"`
+	OK      bool            `json:"ok,omitempty"`
+	Payload json.RawMessage `json:"payload,omitempty"`
+	Error   *struct {
+		Code    string `json:"code,omitempty"`
+		Message string `json:"message,omitempty"`
+	} `json:"error,omitempty"`
+}
+
+type upstreamStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e upstreamStatusError) Error() string {
+	return fmt.Sprintf("upstream returned %d: %s", e.Status, e.Body)
 }
 
 type createJobRequest struct {
@@ -215,6 +243,19 @@ func decodeAndValidateChatRequest(r *http.Request) (chatRequest, error) {
 }
 
 func callOpenClaw(ctx context.Context, cfg config, req chatRequest) (string, error) {
+	content, err := callOpenClawHTTP(ctx, cfg, req)
+	if err == nil {
+		return content, nil
+	}
+
+	var statusErr upstreamStatusError
+	if errors.As(err, &statusErr) && statusErr.Status == http.StatusNotFound {
+		return callOpenClawWS(ctx, cfg, req)
+	}
+	return "", err
+}
+
+func callOpenClawHTTP(ctx context.Context, cfg config, req chatRequest) (string, error) {
 	model := req.Model
 	if strings.TrimSpace(model) == "" {
 		model = "openclaw/" + req.AgentID
@@ -268,7 +309,7 @@ func callOpenClaw(ctx context.Context, cfg config, req chatRequest) (string, err
 
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("upstream returned %d: %s", resp.StatusCode, truncate(raw, 400))
+		return "", upstreamStatusError{Status: resp.StatusCode, Body: truncate(raw, 400)}
 	}
 
 	var out openAIResponse
@@ -286,6 +327,254 @@ func callOpenClaw(ctx context.Context, cfg config, req chatRequest) (string, err
 		return "", errors.New("upstream returned empty content")
 	}
 	return content, nil
+}
+
+func callOpenClawWS(ctx context.Context, cfg config, req chatRequest) (string, error) {
+	wsURL, origin, err := wsEndpointFromUpstream(cfg.UpstreamURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid OPENCLAW_UPSTREAM_URL for websocket: %w", err)
+	}
+
+	header := http.Header{}
+	if origin != "" {
+		header.Set("Origin", origin)
+	}
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 15 * time.Second,
+	}
+	conn, _, err := dialer.DialContext(ctx, wsURL, header)
+	if err != nil {
+		return "", fmt.Errorf("websocket dial failed: %w", err)
+	}
+	defer conn.Close()
+
+	scopes := parseScopes(cfg.Scopes)
+	connectParams := map[string]any{
+		"minProtocol": 3,
+		"maxProtocol": 3,
+		"client": map[string]any{
+			"id":         "openclaw-api",
+			"version":    "openclaw-api",
+			"platform":   "server",
+			"mode":       "backend",
+			"instanceId": "openclaw-api",
+		},
+		"role":      "operator",
+		"scopes":    scopes,
+		"caps":      []string{"tool-events"},
+		"auth":      map[string]any{"token": cfg.Token},
+		"userAgent": "openclaw-api/1.0",
+		"locale":    req.Locale,
+	}
+
+	if _, err := wsRequestCall(ctx, conn, "connect", connectParams); err != nil {
+		return "", fmt.Errorf("websocket connect failed: %w", err)
+	}
+
+	baselineCount, baselineText, err := wsAssistantSnapshot(ctx, conn, req.SessionKey)
+	if err != nil {
+		return "", fmt.Errorf("websocket chat.history baseline failed: %w", err)
+	}
+
+	sendParams := map[string]any{
+		"sessionKey":     req.SessionKey,
+		"idempotencyKey": newWSID(),
+		"message":        req.Message,
+	}
+	if strings.TrimSpace(req.MessageChannel) != "" {
+		sendParams["messageChannel"] = req.MessageChannel
+	}
+	if strings.TrimSpace(req.BackendModel) != "" {
+		sendParams["model"] = req.BackendModel
+	}
+	if _, err := wsRequestCall(ctx, conn, "chat.send", sendParams); err != nil {
+		return "", fmt.Errorf("websocket chat.send failed: %w", err)
+	}
+
+	ticker := time.NewTicker(1200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("timeout waiting chat response: %w", ctx.Err())
+		case <-ticker.C:
+			count, lastText, err := wsAssistantSnapshot(ctx, conn, req.SessionKey)
+			if err != nil {
+				continue
+			}
+			if strings.TrimSpace(lastText) == "" {
+				continue
+			}
+			if count > baselineCount || lastText != baselineText {
+				return strings.TrimSpace(lastText), nil
+			}
+		}
+	}
+}
+
+func wsAssistantSnapshot(ctx context.Context, conn *websocket.Conn, sessionKey string) (int, string, error) {
+	raw, err := wsRequestCall(ctx, conn, "chat.history", map[string]any{
+		"sessionKey": sessionKey,
+		"limit":      60,
+	})
+	if err != nil {
+		return 0, "", err
+	}
+
+	var payload struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return 0, "", err
+	}
+
+	assistantCount := 0
+	lastText := ""
+	for _, m := range payload.Messages {
+		if m.Role != "assistant" {
+			continue
+		}
+		assistantCount++
+		var parts []string
+		for _, c := range m.Content {
+			if c.Type == "text" && strings.TrimSpace(c.Text) != "" {
+				parts = append(parts, c.Text)
+			}
+		}
+		if len(parts) > 0 {
+			lastText = strings.Join(parts, "\n")
+		}
+	}
+	return assistantCount, strings.TrimSpace(lastText), nil
+}
+
+func wsRequestCall(ctx context.Context, conn *websocket.Conn, method string, params any) (json.RawMessage, error) {
+	reqID := newWSID()
+	req := wsRequest{
+		Type:   "req",
+		ID:     reqID,
+		Method: method,
+		Params: params,
+	}
+
+	if err := wsWriteJSON(ctx, conn, req); err != nil {
+		return nil, err
+	}
+
+	for {
+		frame, err := wsReadFrame(ctx, conn)
+		if err != nil {
+			return nil, err
+		}
+		if frame.Type != "res" || frame.ID != reqID {
+			continue
+		}
+		if frame.OK {
+			return frame.Payload, nil
+		}
+
+		msg := "request failed"
+		if frame.Error != nil && strings.TrimSpace(frame.Error.Message) != "" {
+			msg = frame.Error.Message
+		}
+		return nil, errors.New(msg)
+	}
+}
+
+func wsWriteJSON(ctx context.Context, conn *websocket.Conn, v any) error {
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetWriteDeadline(dl)
+	} else {
+		_ = conn.SetWriteDeadline(time.Now().Add(20 * time.Second))
+	}
+	if err := conn.WriteJSON(v); err != nil {
+		return fmt.Errorf("write websocket frame: %w", err)
+	}
+	return nil
+}
+
+func wsReadFrame(ctx context.Context, conn *websocket.Conn) (wsFrame, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetReadDeadline(dl)
+	} else {
+		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	}
+	_, raw, err := conn.ReadMessage()
+	if err != nil {
+		return wsFrame{}, fmt.Errorf("read websocket frame: %w", err)
+	}
+	var frame wsFrame
+	if err := json.Unmarshal(raw, &frame); err != nil {
+		return wsFrame{}, fmt.Errorf("invalid websocket JSON frame: %w", err)
+	}
+	return frame, nil
+}
+
+func wsEndpointFromUpstream(upstream string) (string, string, error) {
+	u, err := url.Parse(strings.TrimSpace(upstream))
+	if err != nil {
+		return "", "", err
+	}
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	case "ws", "wss":
+	default:
+		return "", "", fmt.Errorf("unsupported scheme %q", u.Scheme)
+	}
+	if strings.TrimSpace(u.Path) == "" || u.Path == "/" {
+		u.Path = "/v1/realtime"
+	}
+
+	originURL := *u
+	switch originURL.Scheme {
+	case "ws":
+		originURL.Scheme = "http"
+	case "wss":
+		originURL.Scheme = "https"
+	}
+	originURL.Path = ""
+	originURL.RawPath = ""
+	originURL.RawQuery = ""
+	originURL.Fragment = ""
+
+	return u.String(), originURL.String(), nil
+}
+
+func parseScopes(raw string) []string {
+	out := make([]string, 0, 4)
+	seen := map[string]struct{}{}
+	for _, s := range strings.Split(raw, ",") {
+		scope := strings.TrimSpace(s)
+		if scope == "" {
+			continue
+		}
+		if _, ok := seen[scope]; ok {
+			continue
+		}
+		seen[scope] = struct{}{}
+		out = append(out, scope)
+	}
+	if len(out) == 0 {
+		return []string{"operator.write", "operator.read"}
+	}
+	return out
+}
+
+func newWSID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return fmt.Sprintf("%x", b[:])
 }
 
 func handleCreateJob(w http.ResponseWriter, r *http.Request, cfg config, jobs *jobStore) {
