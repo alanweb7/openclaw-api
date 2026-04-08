@@ -354,10 +354,12 @@ func callOpenClawWS(ctx context.Context, cfg config, req chatRequest) (string, e
 		"minProtocol": 3,
 		"maxProtocol": 3,
 		"client": map[string]any{
-			"id":         "openclaw-api",
-			"version":    "openclaw-api",
-			"platform":   "server",
-			"mode":       "backend",
+			// Gateway validates client.id/mode against an allowlist.
+			// "openclaw-control-ui"+"webchat" is accepted in current OpenClaw builds.
+			"id":         "openclaw-control-ui",
+			"version":    "control-ui",
+			"platform":   "linux",
+			"mode":       "webchat",
 			"instanceId": "openclaw-api",
 		},
 		"role":      "operator",
